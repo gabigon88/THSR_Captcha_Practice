@@ -8,11 +8,10 @@ pylint = "*"
 
 [packages]
 opencv-python = "*"
-matplotlib = "*"
-pytesseract = "*"
-pillow = "*"
-scikit-learn = "*"
+numpy = "*"
+rapidocr = "==3.9.2"
+onnxruntime = "*"
 selenium = "*"
 
 [requires]
-python_version = "3.7"
+python_version = "3.14"

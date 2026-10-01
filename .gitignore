@@ -104,3 +104,6 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# Captured verification-code images are local samples, not source files.
+captcha_samples/*.png

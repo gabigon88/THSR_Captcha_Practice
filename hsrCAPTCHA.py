@@ -1,97 +1,95 @@
+from pathlib import Path
+import re
+
 import cv2
-import matplotlib.pyplot as plt
-import pytesseract
 import numpy as np
-from PIL import Image
-from sklearn.preprocessing import binarize
-from sklearn.preprocessing import PolynomialFeatures
-from sklearn.linear_model import LinearRegression
+from rapidocr import RapidOCR
+
+OCR_ENGINE = RapidOCR()
+SAVE_PREPROCESS_DEBUG_IMAGE = True
+# True 時會在原圖旁輸出 *_processed.png；不需要除錯圖時設為 False。
+
 
 def preprocess(filePath):
     img = cv2.imread(filePath)
+    if img is None:
+        raise ValueError(f"無法讀取圖片：{filePath}")
     dst = cv2.fastNlMeansDenoisingColored(img, None, 30, 30, 7, 21) # 去雜點，30為去雜點的力度
 
-    ''' Debug，預覽雜點效果 
-    plt.subplot(121) # 畫到gird為1*2的子畫布，1號位子上
-    plt.imshow(img)
-    plt.subplot(122) # 畫到gird為1*2的子畫布，2號位子上
-    plt.imshow(dst)
-    plt.show() # 比較去雜點前後的圖片
-    '''
-
     # 將圖片顏色二元化(黑白)，127為門檻值，亮度高於127的設為255，低於127的設為0
-    ret, thresh = cv2.threshold(dst, 127, 255, cv2.THRESH_BINARY_INV) 
-
-    ''' Debug，預覽黑白化效果
-    plt.imshow(thresh)
-    plt.show() # 預覽黑白化的圖片
-    '''
+    _, thresh = cv2.threshold(dst, 127, 255, cv2.THRESH_BINARY_INV)
 
     imgArr = cv2.cvtColor(thresh, cv2.COLOR_BGR2GRAY)
-    yPixelLen, xPixelLen = imgArr.shape # 取得圖片的長*寬
-    imgArr[:,5:-5] = 0 # 只取X軸頭尾各5單位長內的像素點，其他都設為0
-    imageData = np.where(imgArr == 255) # 找出所有白色像素的x, y座標，imageData是二維陣列
+    yPixelLen, xPixelLen = imgArr.shape
 
-    ''' Debug，預覽拋物線的起點、終點
-    plt.scatter(imageData[1], yPixelLen - imageData[0], s = 100, c = 'red', label = 'Cluster 1')
-    plt.ylim(ymin=0, ymax=yPixelLen) # 設定畫布的Y軸高度
-    plt.show() # 預覽拋物線的起點、終點
-    '''
+    newImg = imgArr.copy()
+    edge_width = 5
+    if xPixelLen > edge_width * 2:
+        # Each edge column contributes one median point, so thick strokes do not
+        # receive more weight than thin ones.
+        edge_x = np.r_[0:edge_width, xPixelLen - edge_width:xPixelLen]
+        edge_y = []
+        edge_x_valid = []
+        for x in edge_x:
+            rows = np.flatnonzero(imgArr[:, x] == 255)
+            if rows.size:
+                edge_x_valid.append(x)
+                edge_y.append(float(np.median(rows)))
 
-    X = np.array([imageData[1]])
-    Y = yPixelLen - imageData[0]
-    poly_reg= PolynomialFeatures(degree = 2) # 計算拋物線，指數設為2
-    X_ = poly_reg.fit_transform(X.T)
-    regr = LinearRegression()
-    regr.fit(X_, Y) # 自動補齊拋物線
+        left_count = sum(x < edge_width for x in edge_x_valid)
+        right_count = sum(x >= xPixelLen - edge_width for x in edge_x_valid)
 
-    X2 = np.array([[i for i in range(0, xPixelLen)]])
-    X2_ = poly_reg.fit_transform(X2.T)
+        # Require usable points from both ends before extrapolating across the image.
+        if left_count >= 2 and right_count >= 2 and len(set(edge_x_valid)) >= 4:
+            center_x = (xPixelLen - 1) / 2
+            scale_x = max(center_x, 1.0)
+            normalized_x = (np.asarray(edge_x_valid) - center_x) / scale_x
+            design = np.column_stack((normalized_x ** 2, normalized_x, np.ones_like(normalized_x)))
+            a, b, c = np.linalg.lstsq(design, np.asarray(edge_y), rcond=None)[0]
 
-    ''' Debug，預覽計算出的拋物線
-    plt.scatter(X, Y, color="black")
-    plt.ylim(ymin=0, ymax=yPixelLen) # 設定畫布的Y軸高度
-    plt.plot(X2.T, regr.predict(X2_), color= "blue", linewidth = 3)
-    plt.show() # 預覽計算的拋物線
-    '''
+            if abs(a) > 1e-8:
+                vertex_normalized_x = -b / (2 * a)
+                vertex_x = center_x + scale_x * vertex_normalized_x
+                vertex_y = c - (b * b) / (4 * a)
+                residuals = np.asarray(edge_y) - design @ np.array([a, b, c])
+                fit_rmse = float(np.sqrt(np.mean(residuals ** 2)))
 
-    ''' 印出拋物線資訊
-    print('Coefficient:{}'.format(regr.coef_))
-    print('Intercept:{}'.format(regr.intercept_))
-    '''
+                # Do not apply a curve whose inferred vertex is outside the image
+                # or whose endpoint samples do not agree with a quadratic.
+                if (
+                    0 <= vertex_x < xPixelLen
+                    and 0 <= vertex_y < yPixelLen
+                    and fit_rmse <= max(3.0, yPixelLen * 0.05)
+                ):
+                    all_x = np.arange(xPixelLen)
+                    all_normalized_x = (all_x - center_x) / scale_x
+                    curve_y = a * all_normalized_x ** 2 + b * all_normalized_x + c
+                    curve_rows = np.rint(curve_y).astype(int)
 
-    # 藉由算出的拋物線，修正驗證碼圖片
-    newImg =  cv2.cvtColor(thresh, cv2.COLOR_BGR2GRAY)
-    for ele in np.column_stack([regr.predict(X2_).round(0), X2[0],] ):
-        pos = yPixelLen - int(ele[0])
-        # yUp, yDown = 0, 0
-        # while newImg[pos, int(ele[1])] == newImg[pos+yUp, int(ele[1])] and pos+yUp < yPixelLen-1:
-        #     yUp += 1
-        # while newImg[pos, int(ele[1])] == newImg[pos-yDown, int(ele[1])] and pos-yDown > 0:
-        #     yDown += 1
-        # newImg[pos-yDown:pos+yUp, int(ele[1])] = 255 - newImg[pos-yDown:pos+yUp, int(ele[1])]
-        newImg[pos-3:pos+3, int(ele[1])] = 255 - newImg[pos-3:pos+3, int(ele[1])]
+                    # Preserve the original removal operation: invert a 6-pixel
+                    # band along the completed curve, clipped to image bounds.
+                    for x, row in enumerate(curve_rows):
+                        top = max(0, row - 3)
+                        bottom = min(yPixelLen, row + 3)
+                        if top < bottom:
+                            newImg[top:bottom, x] = 255 - newImg[top:bottom, x]
 
-    ''' Debug，比對修正圖片前後
-    plt.subplot(121)
-    plt.imshow(thresh)
-    plt.subplot(122)
-    plt.imshow(newImg)
-    plt.show() # 比對效果
-    '''
+    if SAVE_PREPROCESS_DEBUG_IMAGE:
+        source_path = Path(filePath)
+        processed_path = source_path.with_name(f"{source_path.stem}_processed.png")
+        if not cv2.imwrite(str(processed_path), newImg):
+            raise OSError(f"無法儲存前處理圖片：{processed_path}")
 
-    # 儲存檔案
-    plt.figure(figsize = (xPixelLen, yPixelLen))
-    plt.imshow(newImg)
-    plt.savefig("captcha_temp.jpg")
-    plt.cla()
+    return newImg
 
 def captchaOCR(filePath):
-    preprocess(filePath)
-    img = Image.open('captcha_temp.jpg')
-    text = pytesseract.image_to_string(img)
-    if text == "":
-        print('無法辨識')
+    processed_image = preprocess(filePath)
+    result = OCR_ENGINE(processed_image)
+    raw_text = "".join(result.txts or ())
+    text = re.sub(r"[^A-Za-z0-9]", "", raw_text)
+
+    if len(text) != 4:
+        print(f"無法辨識（OCR 原始結果：{raw_text!r}；清理後：{text!r}）")
         return None
-    else:
-        return text
+
+    return text
